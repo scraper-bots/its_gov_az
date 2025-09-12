@@ -4,6 +4,7 @@ import json
 import csv
 import time
 import re
+import html
 from urllib.parse import urljoin
 
 class AzerbaijanMedicalScraper:
@@ -22,52 +23,90 @@ class AzerbaijanMedicalScraper:
             'Upgrade-Insecure-Requests': '1'
         })
     
-    def dms_to_decimal(self, dms_str):
-        """Convert DMS (degrees, minutes, seconds) to decimal degrees"""
-        if not dms_str:
+    def parse_coordinates(self, coord_value):
+        """Parse coordinates from various formats"""
+        if not coord_value:
             return None
             
         try:
-            # Clean the string
-            dms_str = str(dms_str).strip().strip('"').strip("'")
+            coord_str = str(coord_value).strip()
             
-            # Try decimal first
+            # Try decimal format first
             try:
-                return float(dms_str)
+                return float(coord_str)
             except ValueError:
                 pass
             
             # Handle DMS format like "40°35'00.2"
-            if '°' in dms_str:
-                # Extract all numbers
-                numbers = re.findall(r'\d+\.?\d*', dms_str)
+            if '°' in coord_str and "'" in coord_str:
+                numbers = re.findall(r'\d+\.?\d*', coord_str)
                 if len(numbers) >= 2:
                     degrees = float(numbers[0])
-                    minutes = float(numbers[1]) if len(numbers) > 1 else 0
+                    minutes = float(numbers[1])
                     seconds = float(numbers[2]) if len(numbers) > 2 else 0
-                    
-                    decimal = degrees + minutes/60 + seconds/3600
-                    return decimal
+                    return degrees + minutes/60 + seconds/3600
             
             return None
             
         except Exception as e:
-            print(f"    Warning: Could not parse coordinate '{dms_str}': {e}")
+            print(f"    Warning: Could not parse coordinate '{coord_value}': {e}")
             return None
     
-    def clean_phone(self, phone_text):
-        """Clean and format phone numbers"""
-        if phone_text:
-            return re.sub(r'\s+', ' ', phone_text.strip())
-        return None
-    
-    def extract_data_safely(self, item, field_name, extractor_func):
-        """Safely extract data with error handling"""
+    def extract_coordinates_from_string(self, coord_string):
+        """Extract lat/lng from coordinate string like '[41.6294932, 46.6420456]'"""
         try:
-            return extractor_func(item)
+            if not coord_string:
+                return None, None
+                
+            # Remove brackets and split
+            clean_coord = coord_string.strip('[]')
+            coords = [c.strip() for c in clean_coord.split(',')]
+            
+            if len(coords) == 2:
+                lat = self.parse_coordinates(coords[0])
+                lng = self.parse_coordinates(coords[1])
+                return lat, lng
+                
         except Exception as e:
-            print(f"    Warning: Could not extract {field_name}: {e}")
-            return None
+            print(f"    Warning: Could not parse coordinate string '{coord_string}': {e}")
+            
+        return None, None
+    
+    def extract_map_url(self, map_url_encoded):
+        """Extract and decode Google Maps embed URL"""
+        try:
+            if not map_url_encoded:
+                return None
+                
+            # Decode HTML entities
+            decoded = html.unescape(map_url_encoded)
+            
+            # Extract iframe src URL
+            iframe_match = re.search(r'src="([^"]+)"', decoded)
+            if iframe_match:
+                return iframe_match.group(1)
+                
+        except Exception:
+            pass
+            
+        return map_url_encoded  # Return original if parsing fails
+    
+    def extract_subsidiary_institutions(self, item):
+        """Extract list of subsidiary medical institutions"""
+        subsidiaries = []
+        try:
+            hospital_list = item.find('div', class_='hospital-list')
+            if hospital_list:
+                ul_element = hospital_list.find('ul')
+                if ul_element:
+                    for li in ul_element.find_all('li'):
+                        text = li.get_text(strip=True)
+                        if text:
+                            subsidiaries.append(text)
+        except Exception as e:
+            print(f"    Warning: Could not extract subsidiaries: {e}")
+            
+        return subsidiaries
     
     def scrape_medical_institutions(self):
         """Scrape medical institutions from the website"""
@@ -78,339 +117,276 @@ class AzerbaijanMedicalScraper:
             response = self.session.get(self.search_url, timeout=30)
             response.raise_for_status()
             
-            # Save the raw page for debugging
-            with open('raw_page.html', 'w', encoding='utf-8') as f:
-                f.write(response.text)
-            print("Raw page saved to raw_page.html")
-            
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Try multiple selectors to find institution items
-            selectors_to_try = [
-                'div.accordion-header.each-item.result-item',
-                'div.result-item',
-                'div.each-item',
-                'div.accordion-header',
-                '[class*="result-item"]',
-                '[class*="each-item"]',
-                '[data-lat]',
-                '[data-coord]'
-            ]
-            
-            institution_items = []
-            for selector in selectors_to_try:
-                items = soup.select(selector)
-                if items:
-                    print(f"Found {len(items)} items with selector: {selector}")
-                    institution_items = items
-                    break
+            # Find institution items using the specific classes
+            institution_items = soup.find_all('div', class_='accordion-header each-item result-item')
             
             if not institution_items:
-                print("No institution items found. Checking page structure...")
-                # Look for any divs with data attributes
-                all_divs = soup.find_all('div')
-                data_divs = [div for div in all_divs if any(attr.startswith('data-') for attr in div.attrs)]
-                print(f"Found {len(data_divs)} divs with data attributes")
+                print("No institution items found. Trying alternative selectors...")
+                # Try fallback selectors
+                alternative_selectors = [
+                    'div.result-item',
+                    'div.each-item', 
+                    '[data-lat]',
+                    '[data-coord]'
+                ]
                 
-                if data_divs:
-                    print("Sample data attributes:")
-                    for i, div in enumerate(data_divs[:3]):
-                        print(f"  Div {i+1}: {dict(div.attrs)}")
-                
-                # Try to extract any meaningful content
-                content_divs = soup.find_all(['div', 'article', 'section'], class_=re.compile(r'.*'))
-                print(f"Found {len(content_divs)} content containers")
-                
+                for selector in alternative_selectors:
+                    items = soup.select(selector)
+                    if items:
+                        print(f"Found {len(items)} items with selector: {selector}")
+                        institution_items = items
+                        break
+            
+            if not institution_items:
+                print("No medical institutions found on the page")
                 return institutions
             
-            print(f"Processing {len(institution_items)} institution items...")
+            print(f"Processing {len(institution_items)} medical institutions...")
             
-            for i, item in enumerate(institution_items):
+            for i, item in enumerate(institution_items, 1):
                 try:
-                    institution_data = {
-                        'item_index': i + 1,
-                        'raw_html': str(item)[:500] + '...' if len(str(item)) > 500 else str(item)
-                    }
+                    print(f"  Processing institution {i}...")
                     
-                    print(f"  Processing item {i+1}...")
+                    institution_data = {}
                     
-                    # Extract all data attributes
-                    for attr_name, attr_value in item.attrs.items():
-                        if attr_name.startswith('data-'):
-                            institution_data[f'raw_{attr_name.replace("-", "_")}'] = attr_value
+                    # Extract coordinates
+                    lat = self.parse_coordinates(item.get('data-lat'))
+                    lng = self.parse_coordinates(item.get('data-long'))
                     
-                    # Extract coordinates with multiple methods
-                    lat_sources = [
-                        item.get('data-lat'),
-                        item.get('data-latitude')
-                    ]
+                    # If individual coordinates failed, try coordinate string
+                    if lat is None or lng is None:
+                        coord_str = item.get('data-coord')
+                        if coord_str:
+                            lat_from_str, lng_from_str = self.extract_coordinates_from_string(coord_str)
+                            if lat is None:
+                                lat = lat_from_str
+                            if lng is None:
+                                lng = lng_from_str
                     
-                    lng_sources = [
-                        item.get('data-long'),
-                        item.get('data-lng'),
-                        item.get('data-longitude')
-                    ]
+                    institution_data['latitude'] = lat
+                    institution_data['longitude'] = lng
                     
-                    coord_sources = [
-                        item.get('data-coord'),
-                        item.get('data-coordinates')
-                    ]
+                    # Extract Google Maps URL
+                    map_url_raw = item.get('data-map-url')
+                    if map_url_raw:
+                        institution_data['google_maps_embed'] = self.extract_map_url(map_url_raw)
                     
-                    # Try to parse coordinates
-                    latitude = None
-                    longitude = None
-                    
-                    # Method 1: separate lat/lng attributes
-                    for lat_val in lat_sources:
-                        if lat_val and latitude is None:
-                            latitude = self.dms_to_decimal(lat_val)
-                            if latitude:
-                                print(f"    Parsed latitude: {latitude} from {lat_val}")
-                    
-                    for lng_val in lng_sources:
-                        if lng_val and longitude is None:
-                            longitude = self.dms_to_decimal(lng_val)
-                            if longitude:
-                                print(f"    Parsed longitude: {longitude} from {lng_val}")
-                    
-                    # Method 2: coordinate string
-                    if (latitude is None or longitude is None):
-                        for coord_str in coord_sources:
-                            if coord_str:
-                                try:
-                                    # Remove brackets and split
-                                    clean_coord = coord_str.strip('[]')
-                                    coords = clean_coord.split(',')
-                                    if len(coords) == 2:
-                                        lat_parsed = self.dms_to_decimal(coords[0].strip())
-                                        lng_parsed = self.dms_to_decimal(coords[1].strip())
-                                        if lat_parsed and lng_parsed:
-                                            latitude = lat_parsed
-                                            longitude = lng_parsed
-                                            print(f"    Parsed coordinates: {latitude}, {longitude} from {coord_str}")
-                                            break
-                                except Exception as e:
-                                    print(f"    Could not parse coord string '{coord_str}': {e}")
-                    
-                    institution_data['latitude'] = latitude
-                    institution_data['longitude'] = longitude
-                    
-                    # Extract name with multiple methods
-                    name_extractors = [
-                        lambda x: x.find('h2', class_='privateHospital'),
-                        lambda x: x.find('h2'),
-                        lambda x: x.find('h1'),
-                        lambda x: x.find('h3'),
-                        lambda x: x.find('[class*="hospital"]'),
-                        lambda x: x.find('[class*="name"]'),
-                        lambda x: x.find('[class*="title"]')
-                    ]
-                    
-                    for extractor in name_extractors:
-                        try:
-                            name_elem = extractor(item)
-                            if name_elem:
-                                name = name_elem.get_text(strip=True)
-                                if name:
-                                    institution_data['name'] = name
-                                    print(f"    Found name: {name}")
-                                    break
-                        except:
-                            continue
+                    # Extract institution name
+                    name_elem = item.find('h2')
+                    if name_elem:
+                        name = name_elem.get_text(strip=True)
+                        if name:
+                            institution_data['name'] = name
+                            print(f"    ✓ Name: {name}")
                     
                     # Extract address
-                    address_extractors = [
-                        lambda x: x.find('div', class_='location'),
-                        lambda x: x.find('[class*="location"]'),
-                        lambda x: x.find('[class*="address"]')
-                    ]
-                    
-                    for extractor in address_extractors:
-                        try:
-                            addr_elem = extractor(item)
-                            if addr_elem:
-                                addr_span = addr_elem.find('span') or addr_elem
-                                if addr_span:
-                                    address = addr_span.get_text(strip=True)
-                                    if address:
-                                        institution_data['address'] = address
-                                        print(f"    Found address: {address}")
-                                        break
-                        except:
-                            continue
+                    location_div = item.find('div', class_='location')
+                    if location_div:
+                        address_span = location_div.find('span')
+                        if address_span:
+                            address = address_span.get_text(strip=True)
+                            if address:
+                                institution_data['address'] = address
+                                print(f"    ✓ Address: {address}")
                     
                     # Extract phone
-                    phone_extractors = [
-                        lambda x: x.find('a', class_='phone'),
-                        lambda x: x.find('[class*="phone"]'),
-                        lambda x: x.find('a[href^="tel:"]')
-                    ]
+                    phone_link = item.find('a', class_='phone')
+                    if phone_link:
+                        phone_span = phone_link.find('span')
+                        if phone_span:
+                            phone = phone_span.get_text(strip=True)
+                            if phone:
+                                institution_data['phone'] = phone
+                                print(f"    ✓ Phone: {phone}")
+                        
+                        # Extract tel: URL
+                        tel_href = phone_link.get('href')
+                        if tel_href and tel_href.startswith('tel:'):
+                            institution_data['phone_link'] = tel_href
                     
-                    for extractor in phone_extractors:
-                        try:
-                            phone_elem = extractor(item)
-                            if phone_elem:
-                                phone_span = phone_elem.find('span') or phone_elem
-                                if phone_span:
-                                    phone = phone_span.get_text(strip=True)
-                                    if phone:
-                                        institution_data['phone'] = self.clean_phone(phone)
-                                        print(f"    Found phone: {phone}")
-                                
-                                href = phone_elem.get('href', '')
-                                if href.startswith('tel:'):
-                                    institution_data['phone_href'] = href
-                                break
-                        except:
-                            continue
+                    # Extract subsidiary institutions
+                    subsidiaries = self.extract_subsidiary_institutions(item)
+                    if subsidiaries:
+                        institution_data['subsidiary_institutions'] = subsidiaries
+                        institution_data['subsidiary_count'] = len(subsidiaries)
+                        print(f"    ✓ Found {len(subsidiaries)} subsidiary institutions")
                     
-                    # Extract map URL
-                    map_url = item.get('data-map-url')
-                    if map_url:
-                        institution_data['map_url'] = map_url
+                    # Add coordinates info
+                    if lat and lng:
+                        print(f"    ✓ Coordinates: {lat}, {lng}")
                     
                     institutions.append(institution_data)
                     
                 except Exception as e:
-                    print(f"    Error processing item {i+1}: {e}")
-                    # Add error info but continue
+                    print(f"    ✗ Error processing institution {i}: {e}")
+                    # Add minimal error record
                     institutions.append({
-                        'item_index': i + 1,
-                        'error': str(e),
-                        'raw_html': str(item)[:200] + '...'
+                        'institution_number': i,
+                        'extraction_error': str(e)
                     })
             
-            print(f"Successfully processed {len(institutions)} items")
+            print(f"\n✓ Successfully processed {len(institutions)} institutions")
+            
+            # Summary statistics
+            valid_institutions = [inst for inst in institutions if inst.get('name')]
+            institutions_with_coords = [inst for inst in institutions if inst.get('latitude') and inst.get('longitude')]
+            institutions_with_subsidiaries = [inst for inst in institutions if inst.get('subsidiary_institutions')]
+            
+            print(f"  - Institutions with names: {len(valid_institutions)}")
+            print(f"  - Institutions with coordinates: {len(institutions_with_coords)}")
+            print(f"  - Institutions with subsidiaries: {len(institutions_with_subsidiaries)}")
+            
             return institutions
             
         except Exception as e:
-            print(f"Major error in scraping: {e}")
-            return institutions  # Return whatever we have
+            print(f"Error in scraping: {e}")
+            return institutions
     
     def save_to_json(self, data, filename='medical_institutions.json'):
-        """Save data to JSON file with robust error handling"""
+        """Save clean data to JSON"""
         try:
-            # Make data JSON serializable
-            clean_data = []
-            for item in data:
-                clean_item = {}
-                for key, value in item.items():
-                    if value is None:
-                        clean_item[key] = None
-                    elif isinstance(value, (str, int, float, bool)):
-                        clean_item[key] = value
-                    else:
-                        clean_item[key] = str(value)
-                clean_data.append(clean_item)
-            
             with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(clean_data, f, ensure_ascii=False, indent=2)
-            print(f"✓ JSON saved: {filename} ({len(clean_data)} items)")
-            
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"✓ JSON saved: {filename} ({len(data)} institutions)")
         except Exception as e:
-            print(f"Error saving JSON: {e}")
-            # Save error info
-            try:
-                with open(f"error_{filename}", 'w', encoding='utf-8') as f:
-                    json.dump({
-                        "error": str(e),
-                        "data_count": len(data),
-                        "sample_data": data[:2] if data else []
-                    }, f, indent=2, ensure_ascii=False)
-            except:
-                pass
+            print(f"✗ Error saving JSON: {e}")
     
     def save_to_csv(self, data, filename='medical_institutions.csv'):
-        """Save data to CSV file with robust error handling"""
+        """Save clean data to CSV"""
         try:
             if not data:
-                # Create empty CSV with basic headers
+                # Create empty CSV with headers
+                headers = ['name', 'address', 'phone', 'latitude', 'longitude', 'subsidiary_count', 'google_maps_embed']
                 with open(filename, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow(['name', 'address', 'phone', 'latitude', 'longitude', 'error'])
-                print(f"✓ Empty CSV saved: {filename}")
+                    writer.writerow(headers)
+                print(f"✓ Empty CSV created: {filename}")
                 return
             
-            # Get all keys
-            all_keys = set()
-            for item in data:
-                all_keys.update(item.keys())
-            
-            sorted_keys = sorted(all_keys)
-            
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=sorted_keys, restval='')
-                writer.writeheader()
+            # Flatten subsidiary institutions for CSV
+            csv_data = []
+            for institution in data:
+                base_row = {
+                    'name': institution.get('name', ''),
+                    'address': institution.get('address', ''),
+                    'phone': institution.get('phone', ''),
+                    'phone_link': institution.get('phone_link', ''),
+                    'latitude': institution.get('latitude', ''),
+                    'longitude': institution.get('longitude', ''),
+                    'google_maps_embed': institution.get('google_maps_embed', ''),
+                    'subsidiary_count': institution.get('subsidiary_count', 0),
+                    'extraction_error': institution.get('extraction_error', '')
+                }
                 
-                for item in data:
-                    clean_row = {}
-                    for key in sorted_keys:
-                        value = item.get(key, '')
-                        if value is None:
-                            clean_row[key] = ''
-                        else:
-                            clean_row[key] = str(value)
-                    writer.writerow(clean_row)
+                # Add subsidiary institutions as a comma-separated string
+                subsidiaries = institution.get('subsidiary_institutions', [])
+                if subsidiaries:
+                    base_row['subsidiary_institutions'] = '; '.join(subsidiaries)
+                else:
+                    base_row['subsidiary_institutions'] = ''
+                
+                csv_data.append(base_row)
             
-            print(f"✓ CSV saved: {filename} ({len(data)} items, {len(sorted_keys)} columns)")
+            # Write CSV
+            if csv_data:
+                fieldnames = csv_data[0].keys()
+                with open(filename, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(csv_data)
+                
+                print(f"✓ CSV saved: {filename} ({len(csv_data)} institutions)")
             
         except Exception as e:
-            print(f"Error saving CSV: {e}")
+            print(f"✗ Error saving CSV: {e}")
     
-    def scrape_with_pagination(self):
-        """Main scraping method"""
-        print("Starting data extraction...")
-        institutions = self.scrape_medical_institutions()
-        time.sleep(1)  # Be respectful
-        return institutions
+    def create_subsidiary_csv(self, data, filename='subsidiary_institutions.csv'):
+        """Create separate CSV for subsidiary institutions"""
+        try:
+            subsidiary_data = []
+            
+            for institution in data:
+                main_name = institution.get('name', 'Unknown')
+                main_address = institution.get('address', '')
+                subsidiaries = institution.get('subsidiary_institutions', [])
+                
+                for subsidiary in subsidiaries:
+                    subsidiary_data.append({
+                        'main_institution': main_name,
+                        'main_address': main_address,
+                        'subsidiary_name': subsidiary,
+                        'latitude': institution.get('latitude', ''),
+                        'longitude': institution.get('longitude', '')
+                    })
+            
+            if subsidiary_data:
+                with open(filename, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=subsidiary_data[0].keys())
+                    writer.writeheader()
+                    writer.writerows(subsidiary_data)
+                
+                print(f"✓ Subsidiary CSV saved: {filename} ({len(subsidiary_data)} subsidiaries)")
+            
+        except Exception as e:
+            print(f"✗ Error saving subsidiary CSV: {e}")
 
 def main():
     """Main function"""
     scraper = AzerbaijanMedicalScraper()
     
-    print("Azerbaijan Medical Institutions Scraper")
+    print("🏥 Azerbaijan Medical Institutions Scraper")
     print("=" * 50)
     
     try:
-        # Run the scraper
-        institutions = scraper.scrape_with_pagination()
+        # Scrape the data
+        institutions = scraper.scrape_medical_institutions()
         
-        print(f"\nExtraction complete!")
-        print(f"Total items found: {len(institutions)}")
-        
-        # Save data regardless of content
-        scraper.save_to_json(institutions)
-        scraper.save_to_csv(institutions)
-        
-        # Show summary
-        valid_names = sum(1 for inst in institutions if inst.get('name'))
-        valid_coords = sum(1 for inst in institutions if inst.get('latitude') and inst.get('longitude'))
-        errors = sum(1 for inst in institutions if inst.get('error'))
-        
-        print(f"\nSummary:")
-        print(f"  Items with names: {valid_names}")
-        print(f"  Items with coordinates: {valid_coords}")
-        print(f"  Items with errors: {errors}")
-        
-        # Show first few results
         if institutions:
-            print(f"\nFirst {min(3, len(institutions))} items:")
-            for i, inst in enumerate(institutions[:3], 1):
-                print(f"\n{i}. Name: {inst.get('name', 'N/A')}")
-                print(f"   Address: {inst.get('address', 'N/A')}")
-                print(f"   Phone: {inst.get('phone', 'N/A')}")
-                print(f"   Coordinates: {inst.get('latitude', 'N/A')}, {inst.get('longitude', 'N/A')}")
-                if inst.get('error'):
-                    print(f"   Error: {inst.get('error')}")
+            print(f"\n📊 Data extraction completed!")
+            
+            # Save main data
+            scraper.save_to_json(institutions)
+            scraper.save_to_csv(institutions)
+            
+            # Create separate subsidiary institutions file
+            scraper.create_subsidiary_csv(institutions)
+            
+            # Display sample results
+            valid_institutions = [inst for inst in institutions if inst.get('name')]
+            
+            if valid_institutions:
+                print(f"\n📋 Sample results (first 2 institutions):")
+                for i, inst in enumerate(valid_institutions[:2], 1):
+                    print(f"\n{i}. {inst.get('name')}")
+                    print(f"   📍 {inst.get('address', 'No address')}")
+                    print(f"   📞 {inst.get('phone', 'No phone')}")
+                    print(f"   🌐 {inst.get('latitude', 'N/A')}, {inst.get('longitude', 'N/A')}")
+                    
+                    subs = inst.get('subsidiary_institutions', [])
+                    if subs:
+                        print(f"   🏥 {len(subs)} subsidiary institutions")
+                        if len(subs) <= 3:
+                            for sub in subs:
+                                print(f"      - {sub}")
+                        else:
+                            for sub in subs[:3]:
+                                print(f"      - {sub}")
+                            print(f"      ... and {len(subs)-3} more")
+            
+            print(f"\n✅ Files created:")
+            print(f"   📄 medical_institutions.json")
+            print(f"   📄 medical_institutions.csv") 
+            print(f"   📄 subsidiary_institutions.csv")
         
-        print(f"\n✓ Files created: medical_institutions.json, medical_institutions.csv")
-        print(f"✓ Debug file: raw_page.html")
-        
+        else:
+            print("❌ No data extracted")
+            scraper.save_to_json([])
+            scraper.save_to_csv([])
+            
     except Exception as e:
-        print(f"Fatal error: {e}")
-        # Still try to save something
-        scraper.save_to_json([])
-        scraper.save_to_csv([])
+        print(f"❌ Fatal error: {e}")
 
 if __name__ == "__main__":
     main()
